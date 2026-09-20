@@ -9,6 +9,7 @@ from openai import OpenAI
 import google.generativeai as genai
 from gtts import gTTS
 import tools
+from streamlit_mic_recorder import speech_to_text
 
 load_dotenv()
 
@@ -25,7 +26,7 @@ st.set_page_config(
 )
 
 st.title("💼 Asistente de Contrataciones Inclusivas (ODS 8)")
-st.caption("Plataforma con accesibilidad de audio vinculada a Datos Abiertos del Perú.")
+st.caption("Plataforma inclusiva con voz bidireccional vinculada a Datos Abiertos del Perú.")
 
 # Función para convertir texto a voz (TTS) con lectura de tildes
 def generar_audio_base64(texto):
@@ -40,7 +41,7 @@ def generar_audio_base64(texto):
     except Exception:
         return None
 
-# Sidebar con estado de PostgreSQL
+# Sidebar con estado de PostgreSQL, dictado por voz y monitor
 with st.sidebar:
     st.header("⚙️ Configuración del Motor")
     engine_choice = st.selectbox(
@@ -49,6 +50,17 @@ with st.sidebar:
     )
     
     activar_voz = st.toggle("🔊 Voz Inclusiva (Lectura con tildes)", value=True)
+    
+    st.divider()
+    st.header("🎙️ Entrada por Voz (STT)")
+    st.caption("Graba tu consulta por micrófono si tienes dificultad para escribir:")
+    audio_transcrito = speech_to_text(
+        language='es',
+        start_prompt="🎤 Iniciar Grabación",
+        stop_prompt="⏹️ Finalizar y Enviar",
+        just_once=True,
+        key="STT_SIDEBAR"
+    )
     
     st.divider()
     st.header("🗄️ Base de Datos Local (PostgreSQL)")
@@ -64,6 +76,11 @@ with st.sidebar:
     
     st.divider()
     st.header("🔔 Monitor de Alertas Automáticas")
+    if st.button("🚀 Monitorear y Enviar Correos"):
+        resultado_monitoreo = tools.ejecutar_monitoreo_alertas()
+        st.toast(resultado_monitoreo, icon="📧")
+        st.rerun()
+        
     alertas = tools.obtener_alertas_db()
     if alertas:
         st.dataframe(alertas, use_container_width=True)
@@ -103,6 +120,12 @@ REGLAS ÉTICAS Y DE INCLUSIÓN:
 - Discapacidad: No descartar, salvo que se trate de una convocatoria específicamente dirigida a dicha población protegida y el postulante corresponda a ella.
 - Evaluar únicamente requisitos laborales verificables.
 - Si tras consultar las fuentes estatales no se encuentran ofertas vigentes compatibles, informa con tono preventivo y empático al postulante y ofrécele activar una Alerta Laboral Automatizada con execute_crear_alerta (solicitando su correo) para notificarle en cuanto se publique una vacante que calce con sus requisitos.
+
+TOLERANCIA A ERRORES GRAMATICALES, TIPOGRÁFICOS Y FONÉTICOS DE VOZ:
+- El usuario puede comunicarse mediante dictado por voz o teclado rápido, lo cual genera transcripciones imprecisas o palabras homófonas (ejemplos: "busco trineo" por "busco empleo", "pago presencial" por "plaza presencial", "sistemas" sin tilde, nombres de carreras truncados).
+- Directriz: Interpreta el sentido contextual de la frase dentro del dominio laboral público.
+- Si el contexto general es claro (ejemplo: "busco trineo en Piura de sistemas"), asume inteligentemente el término laboral ("empleo") y procede con el filtrado sin interrumpir al usuario.
+- Si la transcripción resulta totalmente ininteligible y altera de forma crítica el área profesional, solicita una aclaración breve con tono amigable.
 
 CONTROL ESTRICTO DE AMBIGÜEDADES:
 1. 'Experiencia en programación' -> Pedir o identificar qué lenguajes/tecnologías específicos se consideran.
@@ -176,12 +199,10 @@ def resolver_nombre_modelo():
                 m.name for m in genai.list_models()
                 if "generateContent" in m.supported_generation_methods
             ]
-            # Priorizar cualquier variante flash
             for m in modelos_disponibles:
                 if "flash" in m.lower():
                     modelo_encontrado = m
                     break
-            # Si no hay flash, tomar el primer modelo compatible (ej. gemini-pro)
             if not modelo_encontrado and modelos_disponibles:
                 modelo_encontrado = modelos_disponibles[0]
         except Exception:
@@ -216,11 +237,10 @@ def ejecutar_con_gemini(prompt_usuario):
     chat = obtener_o_crear_chat()
     
     intentos = 3
-    tiempo_espera = 4  # Segundos de enfriamiento
+    tiempo_espera = 4
     
     for intento in range(intentos):
         try:
-            # Pausa preventiva de 1 segundo para amortiguar ráfagas
             time.sleep(1)
             response = chat.send_message(prompt_usuario)
             return response.text
@@ -228,7 +248,6 @@ def ejecutar_con_gemini(prompt_usuario):
         except Exception as ex:
             error_str = str(ex)
             
-            # Control de Rate Limit (429) por preguntas seguidas
             if "429" in error_str or "ResourceExhausted" in error_str:
                 if intento < intentos - 1:
                     with st.status(f"⏳ Esperando enfriamiento de cuota ({tiempo_espera}s)...", expanded=False):
@@ -238,29 +257,32 @@ def ejecutar_con_gemini(prompt_usuario):
                 else:
                     return (
                         "⚠️ **Límite de solicitudes por minuto alcanzado.**\n\n"
-                        "Por favor, espera unos 15 segundos antes de enviar tu siguiente mensaje para permitir que la cuota gratuita de Google AI Studio se restablezca."
+                        "Por favor, espera unos 15 segundos antes de enviar tu siguiente mensaje para permitir que la cuota gratuita se restablezca."
                     )
             
-            # Si el historial interno de funciones quedó corrupto o dio 404, reiniciamos el chat
             if "404" in error_str or "function_call" in error_str:
                 if "gemini_chat" in st.session_state:
                     del st.session_state["gemini_chat"]
                 if "gemini_model_name" in st.session_state:
                     del st.session_state["gemini_model_name"]
                 
-                # Reintento con modelo reconstruido
                 if intento < intentos - 1:
                     chat = obtener_o_crear_chat()
                     continue
 
             return f"Error durante la ejecución: {error_str}"
 
-user_input = st.chat_input("Escribe tu perfil laboral o consulta convocatorias vigentes...")
+# Captura de entrada: teclado o dictado por voz desde la barra lateral
+user_input_escrito = st.chat_input("Escribe tu perfil laboral o consulta convocatorias vigentes...")
+user_input = user_input_escrito or audio_transcrito
 
 if user_input:
     st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
-        st.markdown(user_input)
+        if audio_transcrito and not user_input_escrito:
+            st.markdown(f"🎙️ *Dictado por voz:* {user_input}")
+        else:
+            st.markdown(user_input)
 
     with st.chat_message("assistant"):
         with st.spinner("Procesando con 9 roles y verificando en PostgreSQL..."):
